@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "docling-spark"
+version = "0.1.0"
+description = "Convert Spark DataFrames with Docling Serve"
+readme = "README.md"
+requires-python = ">=3.10,<4"
+license = "MIT"
+authors = [{ name = "Docling Project" }]
+dependencies = [
+  "docling-slim[convert-core,feat-chunking,service-client]>=2.115.0,<3",
+  "pyspark>=3.5,<5",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/docling-project/docling-spark"
+Issues = "https://github.com/docling-project/docling-spark/issues"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<9",
+  "ruff>=0.11,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/docling_spark"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: requires a local Spark runtime and reachable Docling Serve",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+packages = ["docling_spark"]
+follow_imports = "skip"

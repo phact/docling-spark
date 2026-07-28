@@ -20,6 +20,27 @@ pip install docling-spark
 
 The package must be installed on the driver and executors.
 
+## Test
+
+Run the unit tests without external services:
+
+```bash
+uv run pytest
+```
+
+Run the opt-in integration test against a temporary Docling Serve container:
+
+```bash
+./scripts/test-integration.sh
+```
+
+The integration runner starts the CPU image, waits for its health endpoint,
+converts a temporary local Markdown file through a real `local[2]` Spark
+session, and removes the container afterward. The image remains cached. Set
+`DOCLING_SERVE_IMAGE` to test another image, or set `DOCLING_SERVE_URL` (and
+optionally `DOCLING_SERVE_API_KEY`) to use an existing service. The same script
+can be invoked from CI as an optional integration job.
+
 ## Convert a DataFrame
 
 ```python
