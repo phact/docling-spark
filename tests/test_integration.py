@@ -11,7 +11,7 @@ import pytest
 from docling.datamodel.service.options import ConvertDocumentsOptions
 from pyspark.sql import SparkSession
 
-from docling_spark import DoclingConnection, convert_documents
+from docling_spark import DoclingConnection, chunk_documents, convert_documents
 
 pytestmark = [
     pytest.mark.integration,
@@ -35,7 +35,7 @@ def _configure_python_workers() -> None:
     os.environ.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
 
 
-def test_local_file_conversion_through_spark(tmp_path: Path) -> None:
+def test_local_file_conversion_and_chunking_through_spark(tmp_path: Path) -> None:
     _configure_python_workers()
     source = tmp_path / "integration-source.md"
     source.write_text(
@@ -58,32 +58,49 @@ def test_local_file_conversion_through_spark(tmp_path: Path) -> None:
             [(str(source), "integration-document")],
             ["source_path", "document_id"],
         ).coalesce(1)
+        connection = DoclingConnection(
+            url=os.environ.get(
+                "DOCLING_SERVE_URL",
+                "http://127.0.0.1:5001",
+            ),
+            api_key=os.environ.get("DOCLING_SERVE_API_KEY", ""),
+            max_concurrency=1,
+            job_timeout=300,
+        )
+        options = ConvertDocumentsOptions(
+            do_ocr=False,
+            to_formats=["json"],
+        )
         converted = convert_documents(
             frame,
             source_column="source_path",
-            connection=DoclingConnection(
-                url=os.environ.get(
-                    "DOCLING_SERVE_URL",
-                    "http://127.0.0.1:5001",
-                ),
-                api_key=os.environ.get("DOCLING_SERVE_API_KEY", ""),
-                max_concurrency=1,
-                job_timeout=300,
-            ),
-            options=ConvertDocumentsOptions(
-                do_ocr=False,
-                to_formats=["json"],
-            ),
+            connection=connection,
+            options=options,
+        )
+        chunked = chunk_documents(
+            frame,
+            source_column="source_path",
+            connection=connection,
+            options=options,
         )
 
-        row = converted.collect()[0]
+        converted_row = converted.collect()[0]
+        chunked_row = chunked.collect()[0]
     finally:
         spark.stop()
 
-    assert row.docling_status == "success", row.docling_errors
-    assert row.docling_errors == "[]"
-    assert row.source_path == str(source)
-    assert row.document_id == "integration-document"
-    assert row.docling_document
-    assert "# Integration Test" in row.docling_markdown
-    assert row.docling_chunks
+    assert converted_row.docling_status == "success", converted_row.docling_errors
+    assert converted_row.docling_errors == "[]"
+    assert converted_row.source_path == str(source)
+    assert converted_row.document_id == "integration-document"
+    assert converted_row.docling_document
+    assert "# Integration Test" in converted_row.docling_markdown
+    assert "docling_chunks" not in converted_row.asDict()
+
+    assert chunked_row.docling_status == "success", chunked_row.docling_errors
+    assert chunked_row.docling_errors == "[]"
+    assert chunked_row.source_path == str(source)
+    assert chunked_row.document_id == "integration-document"
+    assert chunked_row.docling_chunks
+    assert "Integration Test" in chunked_row.docling_chunks[0].text
+    assert "docling_document" not in chunked_row.asDict()

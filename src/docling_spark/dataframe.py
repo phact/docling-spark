@@ -7,11 +7,11 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Protocol
 
-from docling.chunking import BaseChunker, HybridChunker
 from docling.datamodel.base_models import ConversionStatus
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.service.options import ConvertDocumentsOptions
-from docling.service_client import DoclingServiceClient
+from docling.datamodel.service.responses import ChunkDocumentResponse
+from docling.service_client import ChunkerKind, DoclingServiceClient
 from docling.service_client.exceptions import DoclingServiceClientError
 from pyspark.sql import DataFrame, Row
 from pyspark.sql.types import (
@@ -21,12 +21,18 @@ from pyspark.sql.types import (
     StructType,
 )
 
-OUTPUT_COLUMN_NAMES = frozenset(
+CONVERSION_OUTPUT_COLUMN_NAMES = frozenset(
     {
         "docling_status",
         "docling_errors",
         "docling_document",
         "docling_markdown",
+    }
+)
+CHUNK_OUTPUT_COLUMN_NAMES = frozenset(
+    {
+        "docling_status",
+        "docling_errors",
         "docling_chunks",
     }
 )
@@ -42,6 +48,17 @@ class ConversionClient(Protocol):
         options: ConvertDocumentsOptions,
         raises_on_error: bool,
     ) -> ConversionResult: ...
+
+
+class ChunkingClient(Protocol):
+    """Minimal server-side chunking boundary."""
+
+    def chunk(
+        self,
+        source: str,
+        chunker: ChunkerKind,
+        options: ConvertDocumentsOptions | None = None,
+    ) -> ChunkDocumentResponse: ...
 
 
 @dataclass(frozen=True)
@@ -78,7 +95,11 @@ def convert_documents(
     reusable ``DoclingServiceClient``. Known service failures are captured on their
     source rows; unexpected programming and Spark failures still fail the task.
     """
-    _validate_columns(frame=frame, source_column=source_column)
+    _validate_columns(
+        frame=frame,
+        source_column=source_column,
+        output_columns=CONVERSION_OUTPUT_COLUMN_NAMES,
+    )
     output_schema = StructType(
         [
             *frame.schema.fields,
@@ -86,6 +107,44 @@ def convert_documents(
             StructField("docling_errors", StringType(), nullable=False),
             StructField("docling_document", StringType(), nullable=True),
             StructField("docling_markdown", StringType(), nullable=True),
+        ]
+    )
+    options_json = options.model_dump_json()
+
+    def convert_partition(rows: Iterable[Row]) -> Iterator[tuple[object, ...]]:
+        with connection.create_client() as client:
+            yield from _convert_partition(
+                rows=rows,
+                source_column=source_column,
+                client=client,
+                options=ConvertDocumentsOptions.model_validate_json(options_json),
+            )
+
+    return frame.sparkSession.createDataFrame(
+        frame.rdd.mapPartitions(convert_partition),
+        schema=output_schema,
+    )
+
+
+def chunk_documents(
+    frame: DataFrame,
+    *,
+    source_column: str,
+    connection: DoclingConnection,
+    options: ConvertDocumentsOptions,
+    chunker: ChunkerKind = ChunkerKind.HYBRID,
+) -> DataFrame:
+    """Convert and chunk document sources entirely through Docling Serve."""
+    _validate_columns(
+        frame=frame,
+        source_column=source_column,
+        output_columns=CHUNK_OUTPUT_COLUMN_NAMES,
+    )
+    output_schema = StructType(
+        [
+            *frame.schema.fields,
+            StructField("docling_status", StringType(), nullable=False),
+            StructField("docling_errors", StringType(), nullable=False),
             StructField(
                 "docling_chunks",
                 ArrayType(
@@ -103,18 +162,18 @@ def convert_documents(
     )
     options_json = options.model_dump_json()
 
-    def convert_partition(rows: Iterable[Row]) -> Iterator[tuple[object, ...]]:
+    def chunk_partition(rows: Iterable[Row]) -> Iterator[tuple[object, ...]]:
         with connection.create_client() as client:
-            yield from _convert_partition(
+            yield from _chunk_partition(
                 rows=rows,
                 source_column=source_column,
                 client=client,
                 options=ConvertDocumentsOptions.model_validate_json(options_json),
-                chunker=HybridChunker(),
+                chunker=chunker,
             )
 
     return frame.sparkSession.createDataFrame(
-        frame.rdd.mapPartitions(convert_partition),
+        frame.rdd.mapPartitions(chunk_partition),
         schema=output_schema,
     )
 
@@ -125,7 +184,6 @@ def _convert_partition(
     source_column: str,
     client: ConversionClient,
     options: ConvertDocumentsOptions,
-    chunker: BaseChunker,
 ) -> Iterator[tuple[object, ...]]:
     for row in rows:
         source = row[source_column]
@@ -136,7 +194,6 @@ def _convert_partition(
                 json.dumps(["Source must be a non-empty string"]),
                 None,
                 None,
-                [],
             )
             continue
 
@@ -153,18 +210,67 @@ def _convert_partition(
                 json.dumps([str(error)]),
                 None,
                 None,
+            )
+            continue
+
+        yield (*tuple(row), *_serialize_result(result=result))
+
+
+def _chunk_partition(
+    *,
+    rows: Iterable[Row],
+    source_column: str,
+    client: ChunkingClient,
+    options: ConvertDocumentsOptions,
+    chunker: ChunkerKind,
+) -> Iterator[tuple[object, ...]]:
+    for row in rows:
+        source = row[source_column]
+        if not isinstance(source, str) or not source:
+            yield (
+                *tuple(row),
+                ConversionStatus.FAILURE.value,
+                json.dumps(["Source must be a non-empty string"]),
                 [],
             )
             continue
 
-        yield (*tuple(row), *_serialize_result(result=result, chunker=chunker))
+        try:
+            result = client.chunk(
+                source,
+                chunker=chunker,
+                options=options,
+            )
+        except DoclingServiceClientError as error:
+            yield (
+                *tuple(row),
+                ConversionStatus.FAILURE.value,
+                json.dumps([str(error)]),
+                [],
+            )
+            continue
+
+        yield (
+            *tuple(row),
+            ConversionStatus.SUCCESS.value,
+            "[]",
+            [
+                (
+                    chunk.text,
+                    json.dumps(
+                        chunk.model_dump(mode="json", exclude={"text"}),
+                        separators=(",", ":"),
+                    ),
+                )
+                for chunk in result.chunks
+            ],
+        )
 
 
 def _serialize_result(
     *,
     result: ConversionResult,
-    chunker: BaseChunker,
-) -> tuple[str, str, str | None, str | None, list[tuple[str, str]]]:
+) -> tuple[str, str, str | None, str | None]:
     errors = json.dumps(
         [error.model_dump(mode="json") for error in result.errors],
         separators=(",", ":"),
@@ -173,7 +279,7 @@ def _serialize_result(
         ConversionStatus.SUCCESS,
         ConversionStatus.PARTIAL_SUCCESS,
     }:
-        return result.status.value, errors, None, None, []
+        return result.status.value, errors, None, None
 
     return (
         result.status.value,
@@ -183,23 +289,18 @@ def _serialize_result(
             separators=(",", ":"),
         ),
         result.document.export_to_markdown(),
-        [
-            (
-                chunker.contextualize(chunk=chunk),
-                json.dumps(
-                    chunk.meta.export_json_dict(),
-                    separators=(",", ":"),
-                ),
-            )
-            for chunk in chunker.chunk(result.document)
-        ],
     )
 
 
-def _validate_columns(*, frame: DataFrame, source_column: str) -> None:
+def _validate_columns(
+    *,
+    frame: DataFrame,
+    source_column: str,
+    output_columns: frozenset[str],
+) -> None:
     if source_column not in frame.columns:
         raise ValueError(f"Source column does not exist: {source_column}")
-    collisions = OUTPUT_COLUMN_NAMES.intersection(frame.columns)
+    collisions = output_columns.intersection(frame.columns)
     if collisions:
         raise ValueError(
             "Input DataFrame already contains Docling output columns: "

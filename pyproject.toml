@@ -11,7 +11,7 @@ requires-python = ">=3.10,<4"
 license = "MIT"
 authors = [{ name = "Docling Project" }]
 dependencies = [
-  "docling-slim[convert-core,feat-chunking,service-client]>=2.115.0,<3",
+  "docling-slim[convert-core,service-client]>=2.115.0,<3",
   "pyspark>=3.5,<5",
 ]
 classifiers = [
