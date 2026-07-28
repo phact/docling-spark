@@ -26,13 +26,17 @@ The package must be installed on the driver and executors.
 from docling.datamodel.service.options import ConvertDocumentsOptions
 from docling_spark import DoclingConnection, convert_documents
 
-# Build this column from your object-store manifest. Use short-lived signed URLs
-# when docling-serve cannot directly access the underlying bucket.
-source_df = spark.table("documents.ingest_manifest").select("source_url")
+# Keep stable object identifiers in the manifest. `presign_for_docling` is your
+# platform-specific helper for producing a short-lived signed HTTPS URL.
+source_df = (
+    spark.table("documents.ingest_manifest")
+    .select("document_id", "object_uri")
+    .withColumn("_docling_source_url", presign_for_docling("object_uri"))
+)
 
 converted_df = convert_documents(
     source_df,
-    source_column="source_url",
+    source_column="_docling_source_url",
     connection=DoclingConnection(
         url=dbutils.secrets.get("docling", "url"),
         api_key=dbutils.secrets.get("docling", "api-key"),
@@ -46,8 +50,13 @@ converted_df = convert_documents(
     ),
 )
 
-converted_df.write.format("delta").mode("append").saveAsTable(
-    "documents.docling_conversions"
+(
+    converted_df
+    # Input columns are preserved, so remove the bearer URL before persistence.
+    .drop("_docling_source_url")
+    .write.format("delta")
+    .mode("append")
+    .saveAsTable("documents.docling_conversions")
 )
 ```
 
@@ -67,7 +76,9 @@ does not maintain a second feature schema.
 Source values may be public or signed HTTP(S) URLs reachable by the managed
 service, or local paths available on the Python executor. Native object-store
 URIs such as `s3://...` must be converted to signed HTTP(S) URLs unless the
-files are first materialized on each executor.
+files are first materialized on each executor. Treat signed URLs as temporary
+credentials: avoid logging, caching, or persisting the source column, and drop
+it before writing conversion results.
 
 ## Execution semantics
 
